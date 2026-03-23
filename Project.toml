@@ -2,3 +2,11 @@ name = "NeglectedTropicalDiseases"
 uuid = "71848696-2aeb-4bf0-9b2f-2dfad3734ee3"
 version = "0.1.0"
 authors = ["Joseph Marsh <joe.s.marsh@gmail.com>"]
+
+[deps]
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[compat]
+Distributions = "0.25.123"
+Statistics = "1.11.1"

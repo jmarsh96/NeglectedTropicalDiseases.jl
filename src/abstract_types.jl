@@ -1,0 +1,2 @@
+abstract type AbstractTransmissionModel end
+abstract type AbstractIntervention end
