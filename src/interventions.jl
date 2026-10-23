@@ -10,10 +10,12 @@ end
 
 function set_intervention!(model::AbstractTransmissionModel, intervention::MDAIntervention)
     append!(model.mda_times, intervention.times)
-    append!(model.mda_coverages, intervention.coverages)
+    return append!(model.mda_coverages, intervention.coverages)
 end
 
-function set_intervention!(model::AbstractTransmissionModel, intervention::BednetIntervention)
+function set_intervention!(
+    model::AbstractTransmissionModel, intervention::BednetIntervention
+)
     append!(model.bednet_times, intervention.times)
-    append!(model.bednet_coverages, intervention.coverages)
+    return append!(model.bednet_coverages, intervention.coverages)
 end
