@@ -87,8 +87,12 @@ mutable struct TransfilModel{R<:AbstractRNG} <: AbstractTransmissionModel
 
     # Recorded output
     record_times::Set{Int}
-    records::Vector{NamedTuple{(:time, :ag_baseline, :ag_tas, :mf, :n_tas, :ag_all, :total_worms),
-                               Tuple{Int,Float64,Float64,Float64,Int,Float64,Int}}}
+    records::Vector{
+        NamedTuple{
+            (:time, :ag_baseline, :ag_tas, :mf, :n_tas, :ag_all, :total_worms),
+            Tuple{Int,Float64,Float64,Float64,Int,Float64,Int},
+        },
+    }
 end
 
 """
@@ -97,22 +101,55 @@ end
 
 Create a population of `pop_size` hosts with uniformly distributed ages and no infection.
 """
-function TransfilModel(pop_size::Integer; vth::Real, k::Real, importation_rate::Real,
-                       alpha::Real = 0.58, prop_worm_killed::Real = 0.35, rho::Real = 0.35,
-                       params::TransfilParams = TransfilParams(),
-                       rng::AbstractRNG = Random.default_rng())
+function TransfilModel(
+    pop_size::Integer;
+    vth::Real,
+    k::Real,
+    importation_rate::Real,
+    alpha::Real=0.58,
+    prop_worm_killed::Real=0.35,
+    rho::Real=0.35,
+    params::TransfilParams=TransfilParams(),
+    rng::AbstractRNG=Random.default_rng(),
+)
     n = Int(pop_size)
     age = floor.(rand(rng, n) .* params.max_age)
     bite_risk = rand(rng, Gamma(k, 1 / k), n)
     adherence = rand(rng, n)
     excluded = rand(rng, n) .< params.sys_ex
-    TransfilModel(params, rng, 0, n, Float64(vth), Float64(k), Float64(alpha), Float64(importation_rate),
-                  Float64(prop_worm_killed), Float64(rho), params.initial_larvae, 0.0,
-                  age, bite_risk, zeros(Int, n), zeros(Int, n), zeros(n), falses(n),
-                  excluded, adherence, fill(15 * 12, n),
-                  Int[], Float64[], Int[], Float64[], NaN, Set{Int}(),
-                  NamedTuple{(:time, :ag_baseline, :ag_tas, :mf, :n_tas, :ag_all, :total_worms),
-                             Tuple{Int,Float64,Float64,Float64,Int,Float64,Int}}[])
+    return TransfilModel(
+        params,
+        rng,
+        0,
+        n,
+        Float64(vth),
+        Float64(k),
+        Float64(alpha),
+        Float64(importation_rate),
+        Float64(prop_worm_killed),
+        Float64(rho),
+        params.initial_larvae,
+        0.0,
+        age,
+        bite_risk,
+        zeros(Int, n),
+        zeros(Int, n),
+        zeros(n),
+        falses(n),
+        excluded,
+        adherence,
+        fill(15 * 12, n),
+        Int[],
+        Float64[],
+        Int[],
+        Float64[],
+        NaN,
+        Set{Int}(),
+        NamedTuple{
+            (:time, :ag_baseline, :ag_tas, :mf, :n_tas, :ag_all, :total_worms),
+            Tuple{Int,Float64,Float64,Float64,Int,Float64,Int},
+        }[],
+    )
 end
 
 exposure(m::TransfilModel, i) = min(m.age[i] / m.p.a_max, 1.0)
@@ -123,7 +160,7 @@ exposure(m::TransfilModel, i) = min(m.age[i] / m.p.a_max, 1.0)
 Advance the model `n_months` months. Prevalence is recorded at the start of a month
 whose index is in `m.record_times` (so time `t` is the state before any MDA at `t`).
 """
-function timestep!(m::TransfilModel, n_months::Integer; interventions::Bool = true)
+function timestep!(m::TransfilModel, n_months::Integer; interventions::Bool=true)
     for _ in 1:n_months
         m.time in m.record_times && record_prevalence!(m)
         if interventions
@@ -146,8 +183,8 @@ end
 Run without interventions to endemic equilibrium, then reset the clock to 0 and set the
 pre-intervention reference prevalence used by the importation scaling.
 """
-function burn_in!(m::TransfilModel; months::Integer = 1200)
-    timestep!(m, months; interventions = false)
+function burn_in!(m::TransfilModel; months::Integer=1200)
+    timestep!(m, months; interventions=false)
     m.time = 0
     m.prev_ref = ag_prevalence_all(m)
     return m
@@ -198,7 +235,7 @@ function larvae_dynamics!(m::TransfilModel)
     c = m.bednet_coverage
     lambda_N = p.lambda * (c * p.s_N + (1 - c))
     sigma_N = p.sigma + p.lambda * c * p.d_N
-    m.larvae = lambda_N * p.g * mean_larvae / (sigma_N + lambda_N * p.psi_1)
+    return m.larvae = lambda_N * p.g * mean_larvae / (sigma_N + lambda_N * p.psi_1)
 end
 
 function aging!(m::TransfilModel)
@@ -234,7 +271,7 @@ end
 function importation!(m::TransfilModel)
     p = m.p
     rate = current_importation_rate(m)
-    rate <= 0 && return
+    rate <= 0 && return nothing
     extra = max(p.importation_worms - 1, 0.0)
     @inbounds for i in 1:m.pop_size
         rand(m.rng) < 1 - exp(-rate * exposure(m, i)) || continue
@@ -257,7 +294,7 @@ end
 
 function run_mda!(m::TransfilModel)
     idx = findfirst(==(m.time), m.mda_times)
-    idx === nothing && return
+    idx === nothing && return nothing
     p = m.p
     coverage = m.mda_coverages[idx]
     keep = 1 - m.prop_worm_killed
@@ -270,12 +307,12 @@ function run_mda!(m::TransfilModel)
         m.Mf[i] *= 1 - p.prop_mf_killed
         m.ttreat[i] = 0
     end
-    larvae_dynamics!(m)
+    return larvae_dynamics!(m)
 end
 
 function update_bednet!(m::TransfilModel)
     idx = findfirst(==(m.time), m.bednet_times)
-    idx === nothing && return
+    idx === nothing && return nothing
     m.bednet_coverage = m.bednet_coverages[idx]
     @inbounds for i in 1:m.pop_size
         m.bednet[i] = rand(m.rng) < m.bednet_coverage
@@ -291,9 +328,12 @@ positivity is a Poisson(Mf) > 0 draw (Irvine 2015, Collyer 2020 Table 2).
 function prevalence(m::TransfilModel)
     p = m.p
     lo, hi = p.tas_age_range
-    n_base = 0; pos_base = 0
-    n_tas = 0; pos_tas = 0
-    n_mf = 0; pos_mf = 0
+    n_base = 0
+    pos_base = 0
+    n_tas = 0
+    pos_tas = 0
+    n_mf = 0
+    pos_mf = 0
     pos_all = 0
     total_worms = 0
     @inbounds for i in 1:m.pop_size
@@ -303,10 +343,12 @@ function prevalence(m::TransfilModel)
         ag = worms > 0
         pos_all += ag
         if a >= p.baseline_min_age
-            n_base += 1; pos_base += ag
+            n_base += 1
+            pos_base += ag
         end
         if lo <= a < hi
-            n_tas += 1; pos_tas += ag
+            n_tas += 1
+            pos_tas += ag
         end
         if a >= p.mf_min_age
             n_mf += 1
@@ -314,9 +356,14 @@ function prevalence(m::TransfilModel)
         end
     end
     ratio(x, n) = n == 0 ? 0.0 : x / n
-    return (ag_baseline = ratio(pos_base, n_base), ag_tas = ratio(pos_tas, n_tas),
-            mf = ratio(pos_mf, n_mf), n_tas = n_tas, ag_all = ratio(pos_all, m.pop_size),
-            total_worms = total_worms)
+    return (
+        ag_baseline=ratio(pos_base, n_base),
+        ag_tas=ratio(pos_tas, n_tas),
+        mf=ratio(pos_mf, n_mf),
+        n_tas=n_tas,
+        ag_all=ratio(pos_all, m.pop_size),
+        total_worms=total_worms,
+    )
 end
 
 """Proportion of all hosts with at least one adult worm."""
@@ -328,7 +375,7 @@ function ag_prevalence_all(m::TransfilModel)
     return pos / m.pop_size
 end
 
-record_prevalence!(m::TransfilModel) = push!(m.records, (time = m.time, prevalence(m)...))
+record_prevalence!(m::TransfilModel) = push!(m.records, (time=m.time, prevalence(m)...))
 
 """
     set_record_times!(m, times)
