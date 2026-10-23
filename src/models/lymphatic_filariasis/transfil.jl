@@ -1,326 +1,341 @@
-mutable struct TransfilModel <: AbstractTransmissionModel
+# TRANSFIL (Irvine et al. 2015) with monthly time steps.
+
+"""
+    TransfilParams
+
+Fixed (non-inferred) TRANSFIL parameters. Rates are per month, ages in months.
+"""
+Base.@kwdef struct TransfilParams
+    # Host
+    tau::Float64 = 0.00167 # host death rate
+    max_age::Float64 = 1200.0 # hosts die at 100 years
+    a_max::Float64 = 9.0 * 12 # age at which exposure saturates, h(a) = min(a / a_max, 1)
+
+    # Vector
+    lambda::Float64 = 10.0 # bites per mosquito
+    g::Float64 = 0.37 # proportion of mosquitoes picking up infection
+    sigma::Float64 = 5.0 # mosquito death rate
+    species::Int = 1 # 0 = Culex, 1 = Anopheles
+    kappa::Float64 = 4.395 # L3 uptake saturation (Anopheles)
+    r::Float64 = 0.055 # L3 uptake rate (Anopheles)
+    kappa_culex::Float64 = 4.406
+    r_culex::Float64 = 0.019
+    s_N::Float64 = 0.03 # probability of successful feed with a bednet
+    d_N::Float64 = 0.41 # probability of death with a bednet
+
+    # Worm
+    psi_1::Float64 = 0.414 # proportion of L3 leaving mosquito per bite
+    psi_2::Float64 = 0.32 # proportion of L3 leaving mosquito that enter host
+    s_2::Float64 = 0.00275 # proportion of L3 entering host that develop into adults
+    mu::Float64 = 0.0104 # adult worm death rate
+    gamma::Float64 = 0.1 # mf death rate
+    initial_larvae::Float64 = 5.0
+
+    # MDA (ivermectin + albendazole defaults, Stolk et al. 2018)
+    prop_mf_killed::Float64 = 0.99
+    fecundity::Int = 9 # months without mf production after treatment
+    sys_ex::Float64 = 0.05 # proportion never treated
+    mda_min_age::Float64 = 5.0 * 12
+
+    # Importation
+    importation_mode::Symbol = :proportional # or :constant
+    importation_worms::Float64 = 10.0 # mean worms of each sex in an imported infection (>= 1)
+
+    # Prevalence outputs
+    baseline_min_age::Float64 = 15.0 * 12 # age band compared with the baseline map
+    tas_age_range::Tuple{Float64,Float64} = (6.0 * 12, 8.0 * 12) # [6, 8) years
+    mf_min_age::Float64 = 5.0 * 12
+end
+
+mutable struct TransfilModel{R<:AbstractRNG} <: AbstractTransmissionModel
+    p::TransfilParams
+    rng::R
     time::Int
 
-    # Host
+    # Inferred / sampled parameters
     pop_size::Int
-    tau::Float64          # host death rate (per month)
-    bite_risk::Vector{Float64}
-    bednet::Vector{Int}
+    vth::Float64 # vector to host ratio
+    k::Float64 # gamma shape of individual bite risk
+    alpha::Float64 # mf production per female worm per month (per 20 uL)
+    importation_rate::Float64 # baseline importation rate per host per month
+    prop_worm_killed::Float64 # MDA macrofilaricidal efficacy
+    rho::Float64 # systematic adherence (correlation between rounds)
+
+    # Vector state
+    larvae::Float64
     bednet_coverage::Float64
-    bednet_reduction::Float64
-    k::Float64            # gamma shape for bite risk heterogeneity
-    importation_rate::Float64
 
-    # Vector (mosquito)
-    lambda::Float64       # bite rate (bites/mosquito/month)
-    g::Float64            # L3 uptake efficiency
-    larvae::Float64       # mean L3 density in mosquitoes
-    sigma::Float64        # mosquito death rate
-    kappa::Float64        # L3 development parameter
-    r::Float64            # L3 development parameter
-    species::Int          # 0 = Culex, 1 = Anopheles
-    s_N::Float64          # probability of successful feeding (with bednet)
-    d_N::Float64          # probability of mosquito death (with bednet)
+    # Individual state
+    age::Vector{Float64}
+    bite_risk::Vector{Float64}
+    WF::Vector{Int}
+    WM::Vector{Int}
+    Mf::Vector{Float64}
+    bednet::BitVector
+    excluded::BitVector
+    adherence::Vector{Float64} # u_i ~ U(0, 1), see run_mda!
+    ttreat::Vector{Int}
 
-    # Worm / parasite
-    psi_1::Float64        # proportion L3 leaving mosquito per bite
-    psi_2::Float64        # proportion of L3 that enter host
-    s_2::Float64          # proportion of L3 entering host that develop to adults
-    mu::Float64           # adult worm death rate
-    gamma::Float64        # microfilariae death rate
-    alpha::Float64        # mf production rate per female worm
-    vth::Float64          # vector-to-host ratio
-
-    # Individual-level state
-    WF::Vector{Int}       # female worm counts
-    WM::Vector{Int}       # male worm counts
-    Mf::Vector{Float64}   # microfilariae density per 20 ml blood
-    age::Vector{Float64}  # age in months
-
-    # MDA state
-    treatment_prob::Vector{Float64}
-    ttreat::Vector{Int}           # months since last treatment
-    excluded::Vector{Int}         # 1 if systematically excluded
-    treatment_coverage::Float64
-    systematic_compliance::Float64
-    fecundity::Int                # months of worm infertility post-MDA
-    sys_ex::Float64               # proportion systematically excluded
-    prop_mf_killed::Float64
-    prop_worm_killed::Float64
+    # Interventions
     mda_times::Vector{Int}
     mda_coverages::Vector{Float64}
-
-    # Bednet schedule
     bednet_times::Vector{Int}
     bednet_coverages::Vector{Float64}
 
-    # Prevalence time series
-    worm_prev::Vector{Float64}
-    mf_prev::Vector{Float64}
-    worm_prev67::Vector{Float64}
-    mf_prev67::Vector{Float64}
-    pop67::Vector{Int}
+    # Reference prevalence for the importation scaling (set at the end of burn-in)
+    prev_ref::Float64
+
+    # Recorded output
+    record_times::Set{Int}
+    records::Vector{NamedTuple{(:time, :ag_baseline, :ag_tas, :mf, :n_tas, :ag_all, :total_worms),
+                               Tuple{Int,Float64,Float64,Float64,Int,Float64,Int}}}
 end
 
-function TransfilModel(pop_size::Int)
-    # Fixed parameters (min == max in original)
-    alpha = 0.58
-    kappa = 4.395
-    r     = 0.055
+"""
+    TransfilModel(pop_size; vth, k, importation_rate, prop_worm_killed = 0.35,
+                  rho = 0.35, params = TransfilParams(), rng = Random.default_rng())
 
-    # Drawn parameters
-    k                = rand() * (1.6 - 0.01) + 0.01
-    vth              = rand() * (180.0 - 1.0) + 1.0
-    importation_rate = rand() * 0.0025
-
-    treatment_coverage    = 0.01
-    systematic_compliance = 0.35
-    sys_ex                = 0.05
-
-    # Per-individual draws
-    age        = floor.(rand(pop_size) .* 1200.0)
-    bite_risk  = rand(Gamma(k, 1.0 / k), pop_size)
-
-    beta_shape1 = treatment_coverage * (1 - systematic_compliance) / systematic_compliance
-    beta_shape2 = (1 - treatment_coverage) * (1 - systematic_compliance) / systematic_compliance
-    treatment_prob = rand(Beta(beta_shape1, beta_shape2), pop_size)
-
-    ttreat   = fill(15 * 12, pop_size)
-    excluded = rand(Binomial(1, sys_ex), pop_size)
-    bednet   = zeros(Int, pop_size)  # bednet_coverage = 0 initially
-
-    TransfilModel(
-        0,                        # time
-        pop_size,
-        0.00167,                  # tau
-        bite_risk,
-        bednet,
-        0.0,                      # bednet_coverage
-        0.97,                     # bednet_reduction
-        k,
-        importation_rate,
-        10.0,                     # lambda
-        0.37,                     # g
-        5.0,                      # larvae
-        5.0,                      # sigma
-        kappa,
-        r,
-        1,                        # species (Anopheles)
-        0.03,                     # s_N
-        0.41,                     # d_N
-        0.414,                    # psi_1
-        0.32,                     # psi_2
-        0.00275,                  # s_2
-        0.0104,                   # mu
-        0.1,                      # gamma
-        alpha,
-        vth,
-        zeros(Int, pop_size),     # WF
-        zeros(Int, pop_size),     # WM
-        zeros(Float64, pop_size), # Mf
-        age,
-        treatment_prob,
-        ttreat,
-        excluded,
-        treatment_coverage,
-        systematic_compliance,
-        9,                        # fecundity
-        sys_ex,
-        0.99,                     # prop_mf_killed
-        0.35,                     # prop_worm_killed
-        Int[],                    # mda_times
-        Float64[],                # mda_coverages
-        Int[],                    # bednet_times
-        Float64[],                # bednet_coverages
-        Float64[],                # worm_prev
-        Float64[],                # mf_prev
-        Float64[],                # worm_prev67
-        Float64[],                # mf_prev67
-        Int[],                    # pop67
-    )
+Create a population of `pop_size` hosts with uniformly distributed ages and no infection.
+"""
+function TransfilModel(pop_size::Integer; vth::Real, k::Real, importation_rate::Real,
+                       alpha::Real = 0.58, prop_worm_killed::Real = 0.35, rho::Real = 0.35,
+                       params::TransfilParams = TransfilParams(),
+                       rng::AbstractRNG = Random.default_rng())
+    n = Int(pop_size)
+    age = floor.(rand(rng, n) .* params.max_age)
+    bite_risk = rand(rng, Gamma(k, 1 / k), n)
+    adherence = rand(rng, n)
+    excluded = rand(rng, n) .< params.sys_ex
+    TransfilModel(params, rng, 0, n, Float64(vth), Float64(k), Float64(alpha), Float64(importation_rate),
+                  Float64(prop_worm_killed), Float64(rho), params.initial_larvae, 0.0,
+                  age, bite_risk, zeros(Int, n), zeros(Int, n), zeros(n), falses(n),
+                  excluded, adherence, fill(15 * 12, n),
+                  Int[], Float64[], Int[], Float64[], NaN, Set{Int}(),
+                  NamedTuple{(:time, :ag_baseline, :ag_tas, :mf, :n_tas, :ag_all, :total_worms),
+                             Tuple{Int,Float64,Float64,Float64,Int,Float64,Int}}[])
 end
 
-function timestep!(m::TransfilModel, n_months::Int)
+exposure(m::TransfilModel, i) = min(m.age[i] / m.p.a_max, 1.0)
+
+"""
+    timestep!(m, n_months; interventions = true)
+
+Advance the model `n_months` months. Prevalence is recorded at the start of a month
+whose index is in `m.record_times` (so time `t` is the state before any MDA at `t`).
+"""
+function timestep!(m::TransfilModel, n_months::Integer; interventions::Bool = true)
     for _ in 1:n_months
-        run_mda!(m)
-        update_bednet!(m)
+        m.time in m.record_times && record_prevalence!(m)
+        if interventions
+            run_mda!(m)
+            update_bednet!(m)
+        end
         worm_dynamics!(m)
         mf_dynamics!(m)
         larvae_dynamics!(m)
-        calculate_prevalence!(m)
         aging!(m)
         importation!(m)
+        m.time += 1
     end
+    return m
 end
 
-function burn_in!(m::TransfilModel)
-    for _ in 1:1200
-        timestep!(m, 1)
-        m.time = 0
-    end
-    # Retain only the final prevalence snapshot
-    m.worm_prev   = [last(m.worm_prev)]
-    m.mf_prev     = [last(m.mf_prev)]
-    m.worm_prev67 = [last(m.worm_prev67)]
-    m.mf_prev67   = [last(m.mf_prev67)]
-    m.pop67       = [last(m.pop67)]
+"""
+    burn_in!(m; months = 1200)
+
+Run without interventions to endemic equilibrium, then reset the clock to 0 and set the
+pre-intervention reference prevalence used by the importation scaling.
+"""
+function burn_in!(m::TransfilModel; months::Integer = 1200)
+    timestep!(m, months; interventions = false)
+    m.time = 0
+    m.prev_ref = ag_prevalence_all(m)
+    return m
 end
 
 function worm_dynamics!(m::TransfilModel)
-    for i in 1:m.pop_size
-        age_prop = m.age[i] / (9.0 * 12.0)
-        bite_rate = min(age_prop, 1.0)
-        BNR = m.bednet[i] == 1 ? m.s_N : 1.0
-
-        birth_rate = 0.5 * m.lambda * m.bite_risk[i] * m.vth * m.psi_1 * m.psi_2 *
-                     m.s_2 * bite_rate * m.larvae * BNR
-
-        male_death_rate   = m.WM[i] * m.mu
-        female_death_rate = m.WF[i] * m.mu
-
-        male_births   = birth_rate   > 0 ? rand(Poisson(birth_rate))   : 0
-        female_births = birth_rate   > 0 ? rand(Poisson(birth_rate))   : 0
-        male_deaths   = male_death_rate   > 0 ? rand(Poisson(male_death_rate))   : 0
-        female_deaths = female_death_rate > 0 ? rand(Poisson(female_death_rate)) : 0
-
-        m.WM[i] = max(0, m.WM[i] + male_births   - male_deaths)
+    p = m.p
+    base = 0.5 * p.lambda * m.vth * p.psi_1 * p.psi_2 * p.s_2 * m.larvae
+    @inbounds for i in 1:m.pop_size
+        bnr = m.bednet[i] ? p.s_N : 1.0
+        birth_rate = base * m.bite_risk[i] * exposure(m, i) * bnr
+        male_births = birth_rate > 0 ? rand(m.rng, Poisson(birth_rate)) : 0
+        female_births = birth_rate > 0 ? rand(m.rng, Poisson(birth_rate)) : 0
+        male_deaths = m.WM[i] > 0 ? rand(m.rng, Poisson(p.mu * m.WM[i])) : 0
+        female_deaths = m.WF[i] > 0 ? rand(m.rng, Poisson(p.mu * m.WF[i])) : 0
+        m.WM[i] = max(0, m.WM[i] + male_births - male_deaths)
         m.WF[i] = max(0, m.WF[i] + female_births - female_deaths)
     end
 end
 
 function mf_dynamics!(m::TransfilModel)
-    for i in 1:m.pop_size
-        m.Mf[i] *= (1.0 - m.gamma)
-        m.WM[i] == 0 && continue
-        m.ttreat[i] <= m.fecundity && continue
-        m.Mf[i] += m.alpha * m.WF[i]
-        m.Mf[i] = max(0.0, m.Mf[i])
+    p = m.p
+    @inbounds for i in 1:m.pop_size
+        m.Mf[i] *= 1 - p.gamma
+        if m.WM[i] > 0 && m.ttreat[i] > p.fecundity
+            m.Mf[i] += m.alpha * m.WF[i]
+        end
+    end
+end
+
+function larval_uptake(p::TransfilParams, mf)
+    if p.species == 0
+        return p.kappa_culex * (1 - exp(-p.r_culex * mf / p.kappa_culex))
+    else
+        return p.kappa * (1 - exp(-p.r * mf / p.kappa))^2
     end
 end
 
 function larvae_dynamics!(m::TransfilModel)
-    # Note: the original C++ switch-case has a fall-through bug — case 0 (Culex)
-    # falls through to case 1 (Anopheles), so both species use the squared formula.
-    # This translation faithfully replicates that behaviour.
-    L3 = m.kappa .* (1.0 .- exp.(-m.Mf .* m.r ./ m.kappa)) .^
-         (m.species == 0 ? 2 : 2)  # both cases → squared (faithful to original)
-
-    mean_larvae  = sum(L3 .* m.bite_risk) / sum(m.bite_risk)
-    lambda_bednet = m.lambda * (m.bednet_coverage * (m.s_N - 1.0) + 1.0)
-    sigma_bednet  = m.sigma + m.sigma * m.d_N * m.bednet_coverage
-    m.larvae = lambda_bednet * m.g * mean_larvae / (sigma_bednet + lambda_bednet * m.psi_1)
-end
-
-function calculate_prevalence!(m::TransfilModel)
-    worm_pos    = 0.0
-    worm67_pos  = 0.0
-    mf67_pos    = 0.0
-    cur_pop67   = 0
-
-    for i in 1:m.pop_size
-        age_i = m.age[i]
-        age_i < 12 * 5 && continue
-        (m.WM[i] > 0 || m.WF[i] > 0) && (worm_pos += 1)
-
-        age_i < 12 * 6 && continue
-        age_i > 12 * 8 && continue
-        cur_pop67 += 1
-        (m.WM[i] > 0 || m.WF[i] > 0) && (worm67_pos += 1)
-        m.Mf[i] > 0                    && (mf67_pos   += 1)
+    p = m.p
+    num = 0.0
+    den = 0.0
+    @inbounds for i in 1:m.pop_size
+        num += larval_uptake(p, m.Mf[i]) * m.bite_risk[i]
+        den += m.bite_risk[i]
     end
-
-    mf_ind = rand(m.pop_size) .< (1.0 .- exp.(-m.Mf))
-
-    push!(m.worm_prev,   worm_pos   == 0 ? 0.0 : worm_pos   / m.pop_size)
-    push!(m.mf_prev,     mean(mf_ind))
-    push!(m.worm_prev67, worm67_pos == 0 ? 0.0 : (cur_pop67 == 0 ? 0.0 : worm67_pos / cur_pop67))
-    push!(m.mf_prev67,   mf67_pos   == 0 ? 0.0 : (cur_pop67 == 0 ? 0.0 : mf67_pos   / cur_pop67))
-    push!(m.pop67, cur_pop67)
-
-    # Adjust importation rate after an MDA timestep
-    m.time ∉ m.mda_times && return
-    length(m.worm_prev) < 2 && return
-    prev_before = m.worm_prev[end - 1]
-    prev_before == 0.0 && return
-    prevalence_ratio = m.worm_prev[end] / prev_before
-    m.importation_rate *= prevalence_ratio
+    mean_larvae = num / den
+    c = m.bednet_coverage
+    lambda_N = p.lambda * (c * p.s_N + (1 - c))
+    sigma_N = p.sigma + p.lambda * c * p.d_N
+    m.larvae = lambda_N * p.g * mean_larvae / (sigma_N + lambda_N * p.psi_1)
 end
 
 function aging!(m::TransfilModel)
-    m.age    .+= 1.0
-    m.ttreat .+= 1
-    m.time    += 1
-
-    reset = (rand(m.pop_size) .< (1.0 .- exp.(-m.tau))) .| (m.age .> 1200.0)
-    num_reset = sum(reset)
-    num_reset == 0 && return
-
-    m.age[reset]  .= 0.0
-    m.WF[reset]   .= 0
-    m.WM[reset]   .= 0
-    m.Mf[reset]   .= 0.0
-    m.ttreat[reset] .= 15 * 12
-
-    m.bite_risk[reset] = rand(Gamma(m.k, 1.0 / m.k), num_reset)
-    m.bednet[reset]    = rand(Binomial(1, m.bednet_coverage), num_reset)
-
-    beta_shape1 = m.treatment_coverage * (1 - m.systematic_compliance) / m.systematic_compliance
-    beta_shape2 = (1 - m.treatment_coverage) * (1 - m.systematic_compliance) / m.systematic_compliance
-    m.treatment_prob[reset] = rand(Beta(beta_shape1, beta_shape2), num_reset)
-
-    # Re-draw exclusion status for replaced hosts
-    exclude_candidates = reset .& (rand(m.pop_size) .< m.sys_ex)
-    m.excluded[exclude_candidates] .= 0
+    p = m.p
+    death_prob = 1 - exp(-p.tau)
+    @inbounds for i in 1:m.pop_size
+        m.age[i] += 1
+        m.ttreat[i] += 1
+        if rand(m.rng) < death_prob || m.age[i] > p.max_age
+            m.age[i] = 0.0
+            m.WF[i] = 0
+            m.WM[i] = 0
+            m.Mf[i] = 0.0
+            m.ttreat[i] = 15 * 12
+            m.bite_risk[i] = rand(m.rng, Gamma(m.k, 1 / m.k))
+            m.bednet[i] = rand(m.rng) < m.bednet_coverage
+            m.excluded[i] = rand(m.rng) < p.sys_ex
+            m.adherence[i] = rand(m.rng)
+        end
+    end
 end
 
-function importation!(m::TransfilModel)
-    importation_ind = rand(m.pop_size) .< (1.0 .- exp.(-m.importation_rate))
-    any(importation_ind) || return
+# Touloupou et al. (2022): importation falls in proportion to prevalence after intervention.
+function current_importation_rate(m::TransfilModel)
+    m.p.importation_mode === :constant && return m.importation_rate
+    isnan(m.prev_ref) && return m.importation_rate # burn-in
+    m.prev_ref <= 0 && return 0.0
+    return m.importation_rate * min(ag_prevalence_all(m) / m.prev_ref, 1.0)
+end
 
-    mean_larvae = 10.0
-    new_worms = floor(Int, 0.5 * m.lambda * m.vth * m.psi_1 * m.psi_2 * m.s_2 * mean_larvae)
-    m.WF[importation_ind] .= new_worms
-    m.WM[importation_ind] .= new_worms
-    m.Mf[importation_ind] .= 0.0
+# An imported infection adds at least one worm of each sex, with mean `importation_worms`
+# per sex. Hosts are exposed in proportion to h(a).
+function importation!(m::TransfilModel)
+    p = m.p
+    rate = current_importation_rate(m)
+    rate <= 0 && return
+    extra = max(p.importation_worms - 1, 0.0)
+    @inbounds for i in 1:m.pop_size
+        rand(m.rng) < 1 - exp(-rate * exposure(m, i)) || continue
+        m.WF[i] += 1 + (extra > 0 ? rand(m.rng, Poisson(extra)) : 0)
+        m.WM[i] += 1 + (extra > 0 ? rand(m.rng, Poisson(extra)) : 0)
+    end
+end
+
+"""
+Controlled correlation scheme (Dyson et al. 2017): individual treatment probabilities
+p_i ~ Beta(c(1-rho)/rho, (1-c)(1-rho)/rho) give coverage c and correlation rho between
+rounds. p_i is the Beta quantile of a fixed u_i, so individuals keep their rank when
+coverage changes between rounds.
+"""
+function treatment_probability(coverage, rho, u)
+    rho <= 0 && return coverage
+    c = clamp(coverage, 1e-6, 1 - 1e-6)
+    return quantile(Beta(c * (1 - rho) / rho, (1 - c) * (1 - rho) / rho), u)
 end
 
 function run_mda!(m::TransfilModel)
-    m.time ∈ m.mda_times || return
-
-    for (t, cov) in zip(m.mda_times, m.mda_coverages)
-        t != m.time && continue
-        cov == m.treatment_coverage && continue
-        # Coverage changed — redraw treatment probabilities
-        m.treatment_coverage = cov
-        beta_shape1 = m.treatment_coverage * (1 - m.systematic_compliance) / m.systematic_compliance
-        beta_shape2 = (1 - m.treatment_coverage) * (1 - m.systematic_compliance) / m.systematic_compliance
-        m.treatment_prob .= rand(Beta(beta_shape1, beta_shape2), m.pop_size)
-    end
-
-    U     = rand(m.pop_size)
-    treat = U .< m.treatment_prob
-
-    for i in 1:m.pop_size
-        m.excluded[i] == 1  && continue
-        treat[i]            || continue
-        m.age[i] < 5 * 12   && continue
-
-        m.WM[i]  = floor(Int, m.WM[i]  * (1.0 - m.prop_worm_killed))
-        m.WF[i]  = floor(Int, m.WF[i]  * (1.0 - m.prop_worm_killed))
-        m.Mf[i] *= (1.0 - m.prop_mf_killed)
+    idx = findfirst(==(m.time), m.mda_times)
+    idx === nothing && return
+    p = m.p
+    coverage = m.mda_coverages[idx]
+    keep = 1 - m.prop_worm_killed
+    @inbounds for i in 1:m.pop_size
+        m.excluded[i] && continue
+        m.age[i] < p.mda_min_age && continue
+        rand(m.rng) < treatment_probability(coverage, m.rho, m.adherence[i]) || continue
+        m.WM[i] = m.WM[i] > 0 ? rand(m.rng, Binomial(m.WM[i], keep)) : 0
+        m.WF[i] = m.WF[i] > 0 ? rand(m.rng, Binomial(m.WF[i], keep)) : 0
+        m.Mf[i] *= 1 - p.prop_mf_killed
         m.ttreat[i] = 0
     end
-
     larvae_dynamics!(m)
 end
 
 function update_bednet!(m::TransfilModel)
-    m.time ∈ m.bednet_times || return
-
-    for (t, cov) in zip(m.bednet_times, m.bednet_coverages)
-        t != m.time && continue
-        m.bednet_coverage = cov
-        m.bednet .= rand(Binomial(1, cov), m.pop_size)
-        return
+    idx = findfirst(==(m.time), m.bednet_times)
+    idx === nothing && return
+    m.bednet_coverage = m.bednet_coverages[idx]
+    @inbounds for i in 1:m.pop_size
+        m.bednet[i] = rand(m.rng) < m.bednet_coverage
     end
+end
+
+"""
+    prevalence(m)
+
+Current prevalences. Antigen (Ag) positivity is the presence of any adult worm; mf
+positivity is a Poisson(Mf) > 0 draw (Irvine 2015, Collyer 2020 Table 2).
+"""
+function prevalence(m::TransfilModel)
+    p = m.p
+    lo, hi = p.tas_age_range
+    n_base = 0; pos_base = 0
+    n_tas = 0; pos_tas = 0
+    n_mf = 0; pos_mf = 0
+    pos_all = 0
+    total_worms = 0
+    @inbounds for i in 1:m.pop_size
+        a = m.age[i]
+        worms = m.WF[i] + m.WM[i]
+        total_worms += worms
+        ag = worms > 0
+        pos_all += ag
+        if a >= p.baseline_min_age
+            n_base += 1; pos_base += ag
+        end
+        if lo <= a < hi
+            n_tas += 1; pos_tas += ag
+        end
+        if a >= p.mf_min_age
+            n_mf += 1
+            pos_mf += m.Mf[i] > 0 && rand(m.rng) < 1 - exp(-m.Mf[i])
+        end
+    end
+    ratio(x, n) = n == 0 ? 0.0 : x / n
+    return (ag_baseline = ratio(pos_base, n_base), ag_tas = ratio(pos_tas, n_tas),
+            mf = ratio(pos_mf, n_mf), n_tas = n_tas, ag_all = ratio(pos_all, m.pop_size),
+            total_worms = total_worms)
+end
+
+"""Proportion of all hosts with at least one adult worm."""
+function ag_prevalence_all(m::TransfilModel)
+    pos = 0
+    @inbounds for i in 1:m.pop_size
+        pos += (m.WF[i] + m.WM[i]) > 0
+    end
+    return pos / m.pop_size
+end
+
+record_prevalence!(m::TransfilModel) = push!(m.records, (time = m.time, prevalence(m)...))
+
+"""
+    set_record_times!(m, times)
+
+Record prevalence at the start of each month in `times` (relative to the end of burn-in).
+"""
+function set_record_times!(m::TransfilModel, times)
+    m.record_times = Set{Int}(times)
+    return m
 end
