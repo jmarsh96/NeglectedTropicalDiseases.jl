@@ -1,6 +1,7 @@
 using NeglectedTropicalDiseases
 using NeglectedTropicalDiseases: run_mda!, importation!, aging!, ag_prevalence_all
-using Random, Statistics, Test
+using NeglectedTropicalDiseases: treated, treatment_probability
+using Distributions, Random, Statistics, Test
 
 function model(; n=1000, vth=100.0, k=0.3, imp=0.0, seed=1, kw...)
     return TransfilModel(n; vth=vth, k=k, importation_rate=imp, rng=Xoshiro(seed), kw...)
@@ -75,6 +76,17 @@ end
         @test cor(r1, r2) > 0.3
         r1, r2 = rounds([0.6, 0.6]; rho=0.0)
         @test abs(cor(r1, r2)) < 0.03
+    end
+
+    @testset "treatment decision matches the Beta quantile form" begin
+        rho, c = 0.35, 0.7
+        d = Beta(c * (1 - rho) / rho, (1 - c) * (1 - rho) / rho)
+        us = rand(Xoshiro(2), 10_000)
+        new = [treated(Xoshiro(i), d, c, u) for (i, u) in enumerate(us)]
+        old = [
+            rand(Xoshiro(i)) < treatment_probability(c, rho, u) for (i, u) in enumerate(us)
+        ]
+        @test new == old
     end
 
     @testset "systematic exclusion stays near sys_ex" begin
