@@ -292,16 +292,25 @@ function treatment_probability(coverage, rho, u)
     return quantile(Beta(c * (1 - rho) / rho, (1 - c) * (1 - rho) / rho), u)
 end
 
+# rand() < quantile(d, u) is the same event as cdf(d, rand()) < u, and the cdf is much
+# cheaper than the inverse incomplete beta function.
+function treated(rng, d, coverage, u)
+    d === nothing && return rand(rng) < coverage
+    return cdf(d, rand(rng)) < u
+end
+
 function run_mda!(m::TransfilModel)
     idx = findfirst(==(m.time), m.mda_times)
     idx === nothing && return nothing
     p = m.p
     coverage = m.mda_coverages[idx]
     keep = 1 - m.prop_worm_killed
+    c = clamp(coverage, 1e-6, 1 - 1e-6)
+    d = m.rho <= 0 ? nothing : Beta(c * (1 - m.rho) / m.rho, (1 - c) * (1 - m.rho) / m.rho)
     @inbounds for i in 1:m.pop_size
         m.excluded[i] && continue
         m.age[i] < p.mda_min_age && continue
-        rand(m.rng) < treatment_probability(coverage, m.rho, m.adherence[i]) || continue
+        treated(m.rng, d, coverage, m.adherence[i]) || continue
         m.WM[i] = m.WM[i] > 0 ? rand(m.rng, Binomial(m.WM[i], keep)) : 0
         m.WF[i] = m.WF[i] > 0 ? rand(m.rng, Binomial(m.WF[i], keep)) : 0
         m.Mf[i] *= 1 - p.prop_mf_killed
